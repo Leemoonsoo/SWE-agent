@@ -23,6 +23,8 @@ from sweagent.agent.commands import Command
 from sweagent.utils.config import keys_config
 from sweagent.utils.log import get_logger
 
+import requests
+
 logger = get_logger("api_models")
 
 _MAX_RETRIES = keys_config.get("SWE_AGENT_MODEL_MAX_RETRIES", 10)
@@ -314,6 +316,149 @@ class OpenAIModel(BaseModel):
         output_tokens = response.usage.completion_tokens
         self.update_stats(input_tokens, output_tokens)
         return response.choices[0].message.content
+
+
+class LLMProxyModel(BaseModel):
+    MODELS = {
+        "gpt-3.5-turbo-0125": {
+            "max_context": 16_385,
+            "cost_per_input_token": 5e-07,
+            "cost_per_output_token": 1.5e-06,
+        },
+        "gpt-3.5-turbo-1106": {
+            "max_context": 16_385,
+            "cost_per_input_token": 1.5e-06,
+            "cost_per_output_token": 2e-06,
+        },
+        "gpt-3.5-turbo-16k-0613": {
+            "max_context": 16_385,
+            "cost_per_input_token": 1.5e-06,
+            "cost_per_output_token": 2e-06,
+        },
+        "gpt-4-32k-0613": {
+            "max_context": 32_768,
+            "cost_per_input_token": 6e-05,
+            "cost_per_output_token": 0.00012,
+        },
+        "gpt-4-0613": {
+            "max_context": 8_192,
+            "cost_per_input_token": 3e-05,
+            "cost_per_output_token": 6e-05,
+        },
+        "gpt-4-1106-preview": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1e-05,
+            "cost_per_output_token": 3e-05,
+        },
+        "gpt-4-0125-preview": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1e-05,
+            "cost_per_output_token": 3e-05,
+        },
+        "gpt-4-turbo-2024-04-09": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1e-05,
+            "cost_per_output_token": 3e-05,
+        },
+        "gpt-4o-2024-05-13": {
+            "max_context": 128_000,
+            "cost_per_input_token": 5e-06,
+            "cost_per_output_token": 15e-06,
+        },
+        "gpt-4o-mini-2024-07-18": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.5e-07,
+            "cost_per_output_token": 6e-07,
+        },
+    }
+
+    SHORTCUTS = {
+        "gpt3": "gpt-3.5-turbo-1106",
+        "gpt3-legacy": "gpt-3.5-turbo-16k-0613",
+        "gpt4": "gpt-4-1106-preview",
+        "gpt4-legacy": "gpt-4-0613",
+        "gpt4-0125": "gpt-4-0125-preview",
+        "gpt3-0125": "gpt-3.5-turbo-0125",
+        "gpt4-turbo": "gpt-4-turbo-2024-04-09",
+        "gpt4o": "gpt-4o-2024-05-13",
+        "gpt-4o-mini": "gpt-4o-mini-2024-07-18",
+    }
+
+    def __init__(self, args: ModelArguments, commands: list[Command]):
+        super().__init__(args, commands)
+
+        logging.getLogger("openai").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
+        self._setup_client()
+
+    def _setup_client(self):
+        pass
+
+    def history_to_messages(
+        self,
+        history: list[dict[str, str]],
+        is_demonstration: bool = False,
+    ) -> str | list[dict[str, str]]:
+        """
+        Create `messages` by filtering out all keys except for role/content per `history` turn
+        """
+        # Remove system messages if it is a demonstration
+        if is_demonstration:
+            history = [entry for entry in history if entry["role"] != "system"]
+            return "\n".join([entry["content"] for entry in history])
+        # Return history components with just role, content fields
+        return [{k: v for k, v in entry.items() if k in ["role", "content"]} for entry in history]
+
+    @retry(
+        wait=wait_random_exponential(min=1, max=15),
+        reraise=True,
+        stop=stop_after_attempt(_MAX_RETRIES),
+        retry=retry_if_not_exception_type((CostLimitExceededError, RuntimeError)),
+    )
+    def query(self, history: list[dict[str, str]]) -> str:
+        """
+        Query the OpenAI API with the given `history` and return the response.
+        """
+        api_base_url: str = keys_config["DATABRICKS_HOST"] + "/api/2.0/conversation/proxy"
+        api_key = keys_config["DATABRICKS_API_KEY"]
+
+        completion = {}
+
+        # Perform API call
+        response = requests.post(
+            api_base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "@method": "openAiServiceChatCompletionRequest",
+                "model": self.api_model,
+                "apiVersion": "2024-06-01",
+                "params": {
+                    "messages": self.history_to_messages(history)
+                },
+                "metadata": {
+                    "clientId": "agent-benchmark"
+                }
+            },
+        )
+
+        if response.status_code == 200:
+            resp = response.json()
+            completion = json.loads(resp["completion"])
+            if "error" in completion and completion["error"]["code"].includes("context"):
+                msg = completion["error"]["message"]
+                raise ContextWindowExceededError(msg)
+
+        if response.status_code != 200:
+            msg = f"Error {response.status_code}: {response.text}"
+            raise RuntimeError(msg)
+
+        # Calculate + update costs, return response
+        input_tokens = completion.usage.prompt_tokens
+        output_tokens = completion.usage.completion_tokens
+        self.update_stats(input_tokens, output_tokens)
+        return completion.choices[0].message.content
+
 
 
 class DeepSeekModel(OpenAIModel):
@@ -981,7 +1126,7 @@ def get_model(args: ModelArguments, commands: list[Command] | None = None):
         or args.model_name.startswith("azure:gpt")
         or args.model_name in OpenAIModel.SHORTCUTS
     ):
-        return OpenAIModel(args, commands)
+        return LLMProxyModel(args, commands)
     elif args.model_name.startswith("claude"):
         return AnthropicModel(args, commands)
     elif args.model_name.startswith("bedrock"):

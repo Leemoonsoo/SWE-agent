@@ -25,6 +25,8 @@ from sweagent.environment.swe_env import SWEEnv
 from sweagent.utils.config import convert_paths_to_abspath
 from sweagent.utils.log import get_logger
 
+import requests
+
 
 @dataclass(frozen=True)
 class Subroutine(FrozenSerializable):
