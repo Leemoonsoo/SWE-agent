@@ -370,6 +370,11 @@ class LLMProxyModel(BaseModel):
             "cost_per_input_token": 1.5e-07,
             "cost_per_output_token": 6e-07,
         },
+        "databricks-meta-llama-3-1-70b-instruct": {
+            "max_context": 128_000,
+            "cost_per_input_token": 5e-06,
+            "cost_per_output_token": 15e-06,
+        },
     }
 
     SHORTCUTS = {
@@ -382,6 +387,7 @@ class LLMProxyModel(BaseModel):
         "gpt4-turbo": "gpt-4-turbo-2024-04-09",
         "gpt4o": "gpt-4o-2024-05-13",
         "gpt-4o-mini": "gpt-4o-mini-2024-07-18",
+        "llama3-70b": "databricks-meta-llama-3-1-70b-instruct",
     }
 
     def __init__(self, args: ModelArguments, commands: list[Command]):
@@ -420,45 +426,76 @@ class LLMProxyModel(BaseModel):
         """
         Query the OpenAI API with the given `history` and return the response.
         """
-        api_base_url: str = keys_config["DATABRICKS_HOST"] + "/api/2.0/conversation/proxy"
+        api_base_url: str = keys_config["DATABRICKS_HOST"] + "/api/2.0/conversation/proxy/chat/completions"
         api_key = keys_config["DATABRICKS_API_KEY"]
 
         completion = {}
 
-        # Perform API call
-        response = requests.post(
-            api_base_url,
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "@method": "openAiServiceChatCompletionRequest",
-                "model": self.api_model,
-                "apiVersion": "2024-06-01",
-                "params": {
-                    "messages": self.history_to_messages(history)
-                },
-                "metadata": {
-                    "clientId": "agent-benchmark"
-                }
-            },
-        )
+        if self.api_model.startswith("gpt"):
+            method = "openAiServiceChatCompletionRequest"
 
-        if response.status_code == 200:
-            resp = response.json()
-            completion = json.loads(resp["completion"])
-            if "error" in completion and completion["error"]["code"].includes("context"):
-                msg = completion["error"]["message"]
-                raise ContextWindowExceededError(msg)
+            # Perform API call
+            response = requests.post(
+                api_base_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "@method": method,
+                    "model": self.api_model,
+                    "apiVersion": "2024-06-01",
+                    "params": {
+                        "messages": self.history_to_messages(history)
+                    },
+                    "metadata": {
+                        "clientId": "agent-benchmark"
+                    }
+                },
+            )
+
+            if response.status_code == 200:
+                resp = response.json()
+                completion = json.loads(resp["completion"])
+                if "error" in completion and completion["error"]["code"].includes("context"):
+                    msg = completion["error"]["message"]
+                    raise ContextWindowExceededError(msg)
+        else:
+            # model_serving endpoint want user->assistant->u->a ... alternate
+            new_messages = []
+            for m in self.history_to_messages(history):
+                last_role = new_messages[-1]["role"] if len(new_messages) > 0 else None
+                if m["role"] == last_role:
+                    new_messages[-1]["content"] += "\n\n" + m["content"]
+                else:
+                    new_messages.append(m)
+
+
+            response = requests.post(
+                keys_config["DATABRICKS_HOST"] + "/serving-endpoints/" + self.api_model + "/invocations",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "messages": new_messages
+                },
+            )
+
+            if response.status_code == 200:
+                completion = response.json()
+                if "error" in completion and completion["error"]["code"].includes("context"):
+                    msg = completion["error"]["message"]
+                    raise ContextWindowExceededError(msg)
 
         if response.status_code != 200:
             msg = f"Error {response.status_code}: {response.text}"
             raise RuntimeError(msg)
 
         # Calculate + update costs, return response
-        input_tokens = completion.usage.prompt_tokens
-        output_tokens = completion.usage.completion_tokens
-        self.update_stats(input_tokens, output_tokens)
-        return completion.choices[0].message.content
+        if 'usage' in completion:
+            input_tokens = completion['usage']['prompt_tokens']
+            output_tokens = completion['usage']['completion_tokens']
+            self.update_stats(input_tokens, output_tokens)
 
+        if "choices" not in completion:
+            raise RuntimeError(f"Error: {response.text}")
+
+        return completion["choices"][0]["message"]["content"]
 
 
 class DeepSeekModel(OpenAIModel):
@@ -1122,6 +1159,8 @@ def get_model(args: ModelArguments, commands: list[Command] | None = None):
         return ReplayModel(args, commands)
     elif (
         args.model_name.startswith("gpt")
+        or args.model_name.startswith("databricks")
+        or args.model_name.startswith("llama")
         or args.model_name.startswith("ft:gpt")
         or args.model_name.startswith("azure:gpt")
         or args.model_name in OpenAIModel.SHORTCUTS
