@@ -52,6 +52,9 @@ from sweagent.environment.utils import (
     parse_gh_issue_url,
 )
 
+import os
+from sweagent.agent.magents import MAgent
+
 __doc__: str = """ Run inference. Usage examples:
 
 ```bash
@@ -316,6 +319,9 @@ class Main:
             logger.info(f"📙 Arguments: {args.dumps_yaml()}")
         self.args = args
         self.agent = Agent("primary", args.agent)
+        if os.environ.get("SWE_AGENT_TYPE", None) == "magent":
+            self.agent = MAgent("primary", args.agent)
+
         self.env = SWEEnv(args.environment)
         self._save_arguments()
         default_hooks = [
