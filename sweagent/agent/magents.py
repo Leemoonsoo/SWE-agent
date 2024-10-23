@@ -231,7 +231,12 @@ class MAgent(Agent):
             action = m["tool_calls"][0]["function"]["name"]
             arguments = json.loads(m["tool_calls"][0]["function"]["arguments"])
             for k, v in arguments.items():
-                action = action + " " + str(v)            
+                if cmd == "edit" and k == "end_line":
+                    action = action + ":" + str(v)
+                elif cmd == "edit" and k == "replacement_text":
+                    action = action + "\n" + str(v) + "\nend_of_edit"
+                else:
+                    action = action + " " + str(v)
             output = json.dumps(choice)
             return thought, action, output
         else:

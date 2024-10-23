@@ -214,3 +214,15 @@ submit() {
     cat model.patch
     echo "||SUBMISSION>>"
 }
+
+# @yaml
+# signature: python
+# docstring: run a python script
+# arguments:
+#   filename:
+#     type: string
+#     description: .py file to execute
+#     required: true
+python() {
+    python3 $1
+}
